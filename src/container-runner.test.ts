@@ -16,6 +16,12 @@ vi.mock('./config.js', () => ({
   IDLE_TIMEOUT: 1800000, // 30min
   ONECLI_URL: 'http://localhost:10254',
   TIMEZONE: 'America/Los_Angeles',
+  getAvailableModels: vi.fn(() => [
+    { id: 'cx/gpt-5.4', label: 'Opus' },
+    { id: 'cx/gpt-5.3-codex', label: 'Sonnet' },
+    { id: 'cx/gpt-5.2', label: 'Haiku' },
+  ]),
+  getDefaultModel: vi.fn(() => 'cx/gpt-5.3-codex'),
 }));
 
 // Mock logger
@@ -107,6 +113,7 @@ vi.mock('child_process', async () => {
 
 import { runContainerAgent, ContainerOutput } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
+import { logger } from './logger.js';
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -134,6 +141,71 @@ describe('container-runner timeout behavior', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     fakeProc = createFakeProcess();
+    vi.mocked(logger.info).mockClear();
+  });
+
+  it('uses exact configured model id without remapping', async () => {
+    const exactModelGroup: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { model: 'cx/gpt-5.3-codex-low' },
+    };
+
+    const resultPromise = runContainerAgent(
+      exactModelGroup,
+      testInput,
+      () => {},
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        group: 'Test Group',
+        model: 'cx/gpt-5.3-codex-low',
+        configuredModel: 'cx/gpt-5.3-codex-low',
+      }),
+      'Resolved container model for group',
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-exact',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'success' });
+  });
+
+  it('still resolves legacy tier labels through model aliases', async () => {
+    const legacyModelGroup: RegisteredGroup = {
+      ...testGroup,
+      containerConfig: { model: 'Opus' },
+    };
+
+    const resultPromise = runContainerAgent(
+      legacyModelGroup,
+      testInput,
+      () => {},
+    );
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        group: 'Test Group',
+        model: 'cx/gpt-5.4',
+        configuredModel: 'Opus',
+      }),
+      'Resolved container model for group',
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-legacy',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'success' });
   });
 
   afterEach(() => {

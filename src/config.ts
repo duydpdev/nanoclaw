@@ -1,15 +1,19 @@
 import os from 'os';
 import path from 'path';
 
-import { readEnvFile } from './env.js';
+import { readMergedEnv } from './env.js';
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile([
+const envConfig = readMergedEnv([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'ONECLI_URL',
   'TZ',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'TELEGRAM_BOT_POOL',
 ]);
 
 export const ASSISTANT_NAME =
@@ -95,3 +99,43 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+export const TELEGRAM_BOT_POOL = (
+  process.env.TELEGRAM_BOT_POOL ||
+  envConfig.TELEGRAM_BOT_POOL ||
+  ''
+)
+  .split(',')
+  .map((token) => token.trim())
+  .filter(Boolean);
+
+export interface ModelOption {
+  id: string;
+  label: 'Opus' | 'Sonnet' | 'Haiku';
+}
+
+// Runtime model map (reads latest ~/.claude/settings.json each call)
+export function getAvailableModels(): ModelOption[] {
+  const modelEnv = readMergedEnv([
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  ]);
+
+  const opus = modelEnv.ANTHROPIC_DEFAULT_OPUS_MODEL || 'claude-opus-4-6';
+  const sonnet = modelEnv.ANTHROPIC_DEFAULT_SONNET_MODEL || 'claude-sonnet-4-6';
+  const haiku =
+    modelEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'claude-haiku-4-5-20251001';
+
+  return [
+    { id: opus, label: 'Opus' },
+    { id: sonnet, label: 'Sonnet' },
+    { id: haiku, label: 'Haiku' },
+  ];
+}
+
+export function getDefaultModel(): string {
+  const models = getAvailableModels();
+  const sonnet = models.find((m) => m.label === 'Sonnet');
+  return sonnet?.id || 'claude-sonnet-4-6';
+}

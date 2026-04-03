@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { stopContainer } from './container-runtime.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -191,6 +192,40 @@ export class GroupQueue {
     } catch {
       // ignore
     }
+  }
+
+  /**
+   * Stop the active interactive message run for a group immediately.
+   * Task containers are excluded so scheduled work is not interrupted.
+   * Returns true if an active interactive run existed.
+   */
+  stopActiveRun(groupJid: string): boolean {
+    const state = this.getGroup(groupJid);
+    if (!state.active || !state.groupFolder || state.isTaskContainer) {
+      return false;
+    }
+
+    this.closeStdin(groupJid);
+
+    if (state.containerName) {
+      try {
+        stopContainer(state.containerName);
+        logger.info(
+          { groupJid, containerName: state.containerName },
+          'Stopped active container for group',
+        );
+      } catch (err) {
+        logger.warn(
+          { groupJid, containerName: state.containerName, err },
+          'Failed to stop active container by name',
+        );
+        state.process?.kill('SIGKILL');
+      }
+    } else {
+      state.process?.kill('SIGKILL');
+    }
+
+    return true;
   }
 
   private async runForGroup(

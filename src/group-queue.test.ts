@@ -22,6 +22,10 @@ vi.mock('fs', async () => {
   };
 });
 
+vi.mock('./container-runtime.js', () => ({
+  stopContainer: vi.fn(),
+}));
+
 describe('GroupQueue', () => {
   let queue: GroupQueue;
 
@@ -428,6 +432,33 @@ describe('GroupQueue', () => {
     // sendMessage should return false — user messages must not go to task containers
     const result = queue.sendMessage('group1@g.us', 'hello');
     expect(result).toBe(false);
+
+    resolveTask!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('stopActiveRun returns false for task containers', async () => {
+    const runtime = await import('./container-runtime.js');
+    let resolveTask: () => void;
+
+    const taskFn = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveTask = resolve;
+      });
+    });
+
+    queue.enqueueTask('group1@g.us', 'task-1', taskFn);
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group1@g.us',
+      {} as any,
+      'container-1',
+      'test-group',
+    );
+
+    const stopped = queue.stopActiveRun('group1@g.us');
+    expect(stopped).toBe(false);
+    expect(vi.mocked(runtime.stopContainer)).not.toHaveBeenCalled();
 
     resolveTask!();
     await vi.advanceTimersByTimeAsync(10);

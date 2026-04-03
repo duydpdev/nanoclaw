@@ -12,10 +12,13 @@ import {
   MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
+import { initBotPool } from './channels/telegram.js';
 import {
+  ChannelOpts,
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
@@ -73,6 +76,7 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+const sessionGenerations: Record<string, number> = {};
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -343,6 +347,29 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
+  const sessionGeneration = sessionGenerations[group.folder] || 0;
+
+  const shouldAcceptSessionUpdate = () =>
+    (sessionGenerations[group.folder] || 0) === sessionGeneration;
+
+  const persistSessionIfCurrent = (newSessionId: string) => {
+    if (!shouldAcceptSessionUpdate()) {
+      logger.info(
+        {
+          group: group.name,
+          groupFolder: group.folder,
+          ignoredSessionId: newSessionId,
+          runGeneration: sessionGeneration,
+          currentGeneration: sessionGenerations[group.folder] || 0,
+        },
+        'Ignoring session update from superseded run',
+      );
+      return;
+    }
+
+    sessions[group.folder] = newSessionId;
+    setSession(group.folder, newSessionId);
+  };
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -374,8 +401,7 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          persistSessionIfCurrent(output.newSessionId);
         }
         await onOutput(output);
       }
@@ -398,8 +424,7 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      persistSessionIfCurrent(output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -634,7 +659,7 @@ async function main(): Promise<void> {
   }
 
   // Channel callbacks (shared by all channels)
-  const channelOpts = {
+  const channelOpts: ChannelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
       const trimmed = msg.content.trim();
@@ -671,6 +696,26 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    clearSessionByGroupFolder: (groupFolder: string) => {
+      sessionGenerations[groupFolder] =
+        (sessionGenerations[groupFolder] || 0) + 1;
+      delete sessions[groupFolder];
+      deleteSession(groupFolder);
+      logger.info(
+        { groupFolder, generation: sessionGenerations[groupFolder] },
+        'Cleared group session to apply config changes immediately',
+      );
+    },
+    stopActiveRunByChatJid: (chatJid: string) => {
+      const stopped = queue.stopActiveRun(chatJid);
+      if (stopped) {
+        logger.info(
+          { chatJid },
+          'Signaled active run to stop so model switch applies immediately',
+        );
+      }
+      return stopped;
+    },
   };
 
   // Create and connect all registered channels.
@@ -692,6 +737,10 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
   }
 
   // Start subsystems (independently of connection handler)

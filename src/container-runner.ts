@@ -11,11 +11,14 @@ import {
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   DATA_DIR,
+  getAvailableModels,
+  getDefaultModel,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { readMergedEnv } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -40,6 +43,7 @@ export interface ContainerInput {
   groupFolder: string;
   chatJid: string;
   isMain: boolean;
+  model?: string;
   isScheduledTask?: boolean;
   assistantName?: string;
   script?: string;
@@ -68,7 +72,7 @@ function buildVolumeMounts(
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
-    // (store, group folder, IPC, .claude/) are mounted separately below.
+    // (group folder, IPC, .claude/) are mounted separately below.
     // Read-only prevents the agent from modifying host application code
     // (src/, dist/, package.json, etc.) which would bypass the sandbox
     // entirely on next restart.
@@ -88,15 +92,6 @@ function buildVolumeMounts(
         readonly: true,
       });
     }
-
-    // Main gets writable access to the store (SQLite DB) so it can
-    // query and write to the database directly.
-    const storeDir = path.join(projectRoot, 'store');
-    mounts.push({
-      hostPath: storeDir,
-      containerPath: '/workspace/project/store',
-      readonly: false,
-    });
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -235,12 +230,71 @@ function buildVolumeMounts(
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  group: RegisteredGroup,
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Forward third-party provider settings into container.
+  const envVars = readMergedEnv([
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  ]);
+  if (envVars.ANTHROPIC_BASE_URL) {
+    args.push('-e', `ANTHROPIC_BASE_URL=${envVars.ANTHROPIC_BASE_URL}`);
+  }
+  if (envVars.ANTHROPIC_AUTH_TOKEN) {
+    args.push('-e', `ANTHROPIC_AUTH_TOKEN=${envVars.ANTHROPIC_AUTH_TOKEN}`);
+  }
+  // Forward custom model aliases so /model inside the container maps correctly
+  if (envVars.ANTHROPIC_DEFAULT_OPUS_MODEL) {
+    args.push(
+      '-e',
+      `ANTHROPIC_DEFAULT_OPUS_MODEL=${envVars.ANTHROPIC_DEFAULT_OPUS_MODEL}`,
+    );
+  }
+  if (envVars.ANTHROPIC_DEFAULT_SONNET_MODEL) {
+    args.push(
+      '-e',
+      `ANTHROPIC_DEFAULT_SONNET_MODEL=${envVars.ANTHROPIC_DEFAULT_SONNET_MODEL}`,
+    );
+  }
+  if (envVars.ANTHROPIC_DEFAULT_HAIKU_MODEL) {
+    args.push(
+      '-e',
+      `ANTHROPIC_DEFAULT_HAIKU_MODEL=${envVars.ANTHROPIC_DEFAULT_HAIKU_MODEL}`,
+    );
+  }
+
+  // Use per-group model preference first, then global override/default.
+  // If the stored value is a tier label (Haiku/Sonnet/Opus), resolve it to the
+  // current model ID from settings.json so that settings.json changes take effect
+  // immediately on the next container spawn without re-running /model.
+  const configuredModel = group.containerConfig?.model;
+  let resolvedModel = configuredModel;
+  if (resolvedModel) {
+    const byLabel = getAvailableModels().find(
+      (m) => m.label.toLowerCase() === resolvedModel!.toLowerCase(),
+    );
+    if (byLabel) resolvedModel = byLabel.id;
+  }
+  const model = resolvedModel || envVars.ANTHROPIC_MODEL || getDefaultModel();
+  logger.info(
+    {
+      group: group.name,
+      configuredModel,
+      model,
+    },
+    'Resolved container model for group',
+  );
+  args.push('-e', `ANTHROPIC_MODEL=${model}`);
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
@@ -304,6 +358,7 @@ export async function runContainerAgent(
   const containerArgs = await buildContainerArgs(
     mounts,
     containerName,
+    group,
     agentIdentifier,
   );
 
